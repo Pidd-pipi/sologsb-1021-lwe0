@@ -1,0 +1,15 @@
+# Nuxt
+.nuxt/
+.output/
+dist/
+.data/
+
+# 依赖
+node_modules/
+
+# 合流测试的临时打包产物
+test/.bundles/
+
+# 日志
+*.log
+.npm/

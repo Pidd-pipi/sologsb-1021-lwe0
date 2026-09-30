@@ -3,11 +3,18 @@ import { defineStore } from 'pinia';
 import type {
   AuditRecord, DictionaryEntry, DictionarySnapshot, DuplicatePair, EntryStatus, ReviewComment, VersionRecord
 } from '~/types/dictionary';
+import type { PendingMerge, ResolutionMap } from '~/types/merge';
+import { conflictPath } from '~/types/merge';
+import { conflictSignature, deepEqual, detectConflicts, resolutionStillValid, threeWayMerge } from '~/utils/merge';
 import { findDuplicates } from '~/utils/dictionary';
 
+const STORAGE_KEY = 'sologsb-1021-dictionary-v1';
+const PENDING_PREFIX = 'sologsb-1021-pending-v1:';
+
 const now = () => new Date().toISOString();
-const uid = (prefix: string) => `${prefix}-${Math.random().toString(36).slice(2, 9)}-${Date.now().toString(36)}`;
+const localUid = (prefix: string) => `${prefix}-${Math.random().toString(36).slice(2, 9)}-${Date.now().toString(36)}`;
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+const isClient = () => import.meta.client;
 
 const seedEntries = (): DictionaryEntry[] => [
   {
@@ -67,12 +74,21 @@ export const useDictionaryStore = defineStore('dictionary', () => {
   const dialectFilter = ref('all');
   const fieldReplyDrafts = reactive<Record<string, string>>({});
 
+  // 多页面合流状态
+  const actor = ref(`编校页-${localUid('page').slice(-4)}`);
+  const baseSnapshot = ref<DictionarySnapshot | null>(null);
+  const pendingMerge = ref<PendingMerge | null>(null);
+  const syncError = ref('');
+  const syncNotice = ref('');
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+
   const selectedEntry = computed(() => entries.find((entry) => entry.id === selectedId.value) ?? entries[0]);
   const persistableSnapshot = computed<DictionarySnapshot>(() => ({
     revision: revision.value,
     entries: clone(entries),
     versions: clone(versions),
-    audit: clone(audit)
+    audit: clone(audit),
+    selectedId: selectedId.value
   }));
   const duplicates = computed<DuplicatePair[]>(() => findDuplicates(entries));
   const openComments = computed(() => entries.reduce((sum, entry) => sum + entry.reviewerComments.filter((comment) => comment.status === 'open').length, 0));
@@ -87,13 +103,44 @@ export const useDictionaryStore = defineStore('dictionary', () => {
     });
   });
   const dialects = computed(() => [...new Set(entries.flatMap((entry) => entry.dialectVariants.map((variant) => variant.dialect)))].sort());
+  const pendingConflicts = computed(() => {
+    const pending = pendingMerge.value;
+    if (!pending) return [];
+    return detectConflicts(pending.local, pending.remote, pending.base);
+  });
+  /** 已做出且对当前三方值仍有效的选择数 */
+  const pendingResolvedCount = computed(() => {
+    const pending = pendingMerge.value;
+    if (!pending) return 0;
+    return pendingConflicts.value.reduce((sum, conflict) => {
+      const resolution = pending.resolutions[conflictPath(conflict)];
+      return sum + (resolution && resolutionStillValid(conflict, resolution) ? 1 : 0);
+    }, 0);
+  });
+
+  function flashNotice(message: string) {
+    syncNotice.value = message;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { syncNotice.value = ''; }, 6000);
+  }
+
+  /** 用给定快照替换工作区（不产生版本记录、不动基快照） */
+  function adopt(value: DictionarySnapshot) {
+    revision.value = value.revision ?? 1;
+    entries.splice(0, entries.length, ...(clone(value.entries ?? [])));
+    versions.splice(0, versions.length, ...(clone(value.versions ?? [])));
+    audit.splice(0, audit.length, ...(clone(value.audit ?? [])));
+    if (value.selectedId && entries.some((entry) => entry.id === value.selectedId)) selectedId.value = value.selectedId;
+    else if (!entries.some((entry) => entry.id === selectedId.value)) selectedId.value = entries[0]?.id ?? '';
+  }
 
   function snapshot(): DictionarySnapshot {
     return {
       revision: revision.value,
       entries: clone(entries),
       versions: clone(versions),
-      audit: clone(audit)
+      audit: clone(audit),
+      selectedId: selectedId.value
     };
   }
 
@@ -102,7 +149,8 @@ export const useDictionaryStore = defineStore('dictionary', () => {
     entries.splice(0, entries.length, ...(clone(value.entries ?? [])));
     versions.splice(0, versions.length, ...(clone(value.versions ?? [])));
     audit.splice(0, audit.length, ...(clone(value.audit ?? [])));
-    if (!entries.some((entry) => entry.id === selectedId.value)) selectedId.value = entries[0]?.id ?? '';
+    if (value.selectedId && entries.some((entry) => entry.id === value.selectedId)) selectedId.value = value.selectedId;
+    else if (!entries.some((entry) => entry.id === selectedId.value)) selectedId.value = entries[0]?.id ?? '';
   }
 
   function commit(action: string, detail: string, entryIds: string[], mutation: () => void) {
@@ -112,15 +160,244 @@ export const useDictionaryStore = defineStore('dictionary', () => {
     mutation();
     revision.value += 1;
     entries.forEach((entry) => { if (entryIds.includes(entry.id)) entry.updatedAt = now(); });
-    versions.unshift({ id: uid('version'), at: now(), action, detail, entryId: entryIds[0], before });
+    versions.unshift({ id: localUid('version'), at: now(), action, detail, entryId: entryIds[0], before });
     versions.splice(120);
-    audit.unshift({ id: uid('audit'), at: now(), action, detail, entryIds });
+    audit.unshift({ id: localUid('audit'), at: now(), action, detail, entryIds });
     audit.splice(300);
+  }
+
+  // ---------- 多页面修订合流 ----------
+
+  function readRemote(): DictionarySnapshot | null {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as DictionarySnapshot;
+  }
+
+  /** 先序列化再写入；任何失败都不改动 localStorage，调用方据此保留状态重试 */
+  function writeSnapshot(value: DictionarySnapshot): boolean {
+    const serialized = JSON.stringify(value);
+    localStorage.setItem(STORAGE_KEY, serialized);
+    return true;
+  }
+
+  function persistSidecar(pending: PendingMerge | null) {
+    // 每个编校页一个挂起槽（按 actor），不清除其它页面的暂存
+    const key = `${PENDING_PREFIX}${actor.value}`;
+    if (!pending) { localStorage.removeItem(key); return; }
+    localStorage.setItem(key, JSON.stringify(pending));
+  }
+
+  function readSidecar(): PendingMerge | null {
+    let latestPending: PendingMerge | null = null;
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key?.startsWith(PENDING_PREFIX)) continue;
+      try {
+        const value = JSON.parse(localStorage.getItem(key) ?? 'null') as PendingMerge | null;
+        if (value && (!latestPending || value.createdAt > latestPending.createdAt)) latestPending = value;
+      } catch {
+        localStorage.removeItem(key);
+      }
+    }
+    return latestPending;
+  }
+
+  function makePending(local: DictionarySnapshot, remote: DictionarySnapshot, base: DictionarySnapshot, resolutions: ResolutionMap): PendingMerge {
+    return { id: localUid('pending'), actor: actor.value, createdAt: now(), local: clone(local), remote: clone(remote), base: clone(base), resolutions: clone(resolutions) };
+  }
+
+  /**
+   * 与对端最新修订合流：
+   * - 无冲突：直接返回合流快照；
+   * - 有冲突：登记挂起（含此前的选择），由并排对话框确认。
+   */
+  function integrateRemote(remote: DictionarySnapshot, localSnapshot: DictionarySnapshot): DictionarySnapshot | null {
+    const base = baseSnapshot.value!;
+    const nextRevision = Math.max(localSnapshot.revision, remote.revision) + 1;
+    const result = threeWayMerge({
+      local: localSnapshot, remote, base,
+      resolutions: pendingMerge.value?.resolutions ?? {},
+      revision: nextRevision, now: now(), actor: actor.value
+    });
+    if (!result.ok || !result.merged) {
+      const resolutions = pendingMerge.value?.resolutions ?? {};
+      pendingMerge.value = makePending(localSnapshot, remote, base, resolutions);
+      try { persistSidecar(pendingMerge.value); } catch { syncError.value = '合流选择暂时无法写入浏览器存储，但当前页面已保留你的选择，请处理后重试。'; }
+      return null;
+    }
+    return result.merged;
+  }
+
+  /** 采用来自另一页面/合流的修订：旧撤销栈属于上一修订谱系，继续撤销会退回先保存者，故清空（版本记录仍可恢复） */
+  function landRevision(value: DictionarySnapshot, notice?: string) {
+    adopt(value);
+    baseSnapshot.value = clone(value);
+    undoStack.value = [];
+    redoStack.value = [];
+    syncError.value = '';
+    if (notice) flashNotice(notice);
+  }
+
+  /**
+   * 保存工作区到浏览器。每次写入前重新读取对端修订：
+   * 对端先行保存时先做词条修订合流；合流或写入失败都保留当前状态，重试时重新读取，绝不覆盖先保存者。
+   */
+  function syncToBrowser() {
+    if (!isClient() || !hydrated.value || !baseSnapshot.value) return;
+    if (pendingMerge.value) return; // 有未确认冲突时不写回
+    const localSnapshot = persistableSnapshot.value;
+    if (deepEqual(localSnapshot, baseSnapshot.value) && revision.value === baseSnapshot.value.revision) return;
+
+    let remote: DictionarySnapshot | null = null;
+    try {
+      remote = readRemote();
+    } catch {
+      syncError.value = '无法读取浏览器中的词库数据（数据可能损坏）。当前编辑完整保留，请处理后重试，系统不会覆盖已有数据。';
+      return;
+    }
+
+    // 对端抢先保存（含同修订号分叉：两页都从同一基版本出发各自首改）：先合流
+    if (remote && (remote.revision > baseSnapshot.value.revision
+      || (remote.revision === baseSnapshot.value.revision && !deepEqual(remote, baseSnapshot.value)))) {
+      let merged: DictionarySnapshot | null = null;
+      try {
+        merged = integrateRemote(remote, localSnapshot);
+      } catch (error) {
+        syncError.value = `修订合流失败：${(error as Error).message}。当前编辑已保留，可重试。`;
+        return;
+      }
+      if (!merged || pendingMerge.value) {
+        flashNotice('检测到另一编校页面的修订存在同字段冲突，已并排列出；确认前不会写回。');
+        return;
+      }
+      try {
+        writeSnapshot(merged);
+      } catch (error) {
+        syncError.value = `合流结果写入失败（${(error as Error).message || '存储不可用'}）。双方内容与你的选择都已保留，请重试。`;
+        return;
+      }
+      const autoCount = merged.audit.find((item) => item.id.startsWith(`audit-merge-${merged.revision}`))?.entryIds.length ?? 0;
+      landRevision(merged, autoCount ? `已按词条修订自动合流：并入另一页面涉及 ${autoCount} 个词条的改动，版本记录与审校意见一并保存。` : '已与另一页面的修订合流。');
+      return;
+    }
+
+    // 无人抢先，直接保存
+    try {
+      writeSnapshot(localSnapshot);
+    } catch (error) {
+      syncError.value = `写入浏览器失败（${(error as Error).message || '存储不可用'}）。刚才的编辑完整保留，点击重试会重新读取对端修订后再保存。`;
+      return;
+    }
+    baseSnapshot.value = clone(localSnapshot);
+    syncError.value = '';
+  }
+
+  /** 写入失败后重试：重新读取对端，重新合流，再写回 */
+  function retrySync() {
+    syncError.value = '';
+    if (pendingMerge.value) { resolvePendingMerge(); return; }
+    syncToBrowser();
+  }
+
+  /** 另一页面写入（storage 事件）时调用 */
+  function handleExternalStorage(key: string) {
+    if (!hydrated.value || !baseSnapshot.value) return;
+    if (key.startsWith(PENDING_PREFIX)) return;
+    if (key !== STORAGE_KEY) return;
+    let remote: DictionarySnapshot | null = null;
+    try { remote = readRemote(); } catch { return; }
+    if (!remote) return;
+
+    // 本页正停在冲突确认界面：刷新对端快照，重试时以最新修订合流
+    if (pendingMerge.value) {
+      pendingMerge.value = { ...pendingMerge.value, remote: clone(remote) };
+      return;
+    }
+
+    const localSnapshot = persistableSnapshot.value;
+    if (deepEqual(localSnapshot, baseSnapshot.value)) {
+      // 本页没有未保存改动：直接快进到对端修订
+      landRevision(remote);
+      return;
+    }
+
+    // 本页也有改动：立即按词条修订合流；干净则自动写回，有冲突则挂起
+    let merged: DictionarySnapshot | null = null;
+    try {
+      merged = integrateRemote(remote, localSnapshot);
+    } catch {
+      return;
+    }
+    if (!merged || pendingMerge.value) return;
+    try {
+      writeSnapshot(merged);
+    } catch {
+      syncError.value = '自动合流后的修订写入失败，编辑已保留，请点击重试。';
+      return;
+    }
+    const autoCount = merged.audit.find((item) => item.id.startsWith(`audit-merge-${merged.revision}`))?.entryIds.length ?? 0;
+    landRevision(merged, autoCount ? `另一页面保存了修订，已自动合流 ${autoCount} 个词条的非冲突改动。` : '已与另一页面的修订合流。');
+  }
+
+  /** 冲突对话框中更新某条冲突的选择（立即随挂起包持久化，刷新不丢） */
+  function chooseResolution(path: string, choice: NonNullable<ResolutionMap[string]>['choice']) {
+    const pending = pendingMerge.value;
+    if (!pending) return;
+    const conflict = pendingConflicts.value.find((item) => conflictPath(item) === path);
+    if (!conflict) return;
+    pending.resolutions[path] = { choice, signature: conflictSignature(conflict) };
+    try { persistSidecar(pending); } catch { /* 内存中仍保留，重试时继续 */ }
+  }
+
+  /** 确认合流：重新读取对端最新修订、带上挂起期间本页的继续编辑再算一遍；若对端又推进过，旧选择失配的冲突重新列出 */
+  function resolvePendingMerge() {
+    const pending = pendingMerge.value;
+    if (!pending) return;
+    syncError.value = '';
+
+    let remote: DictionarySnapshot;
+    try {
+      remote = readRemote() ?? pending.remote;
+    } catch {
+      syncError.value = '无法重新读取对端修订，当前选择已保留，请重试。';
+      return;
+    }
+
+    // 挂起期间本页若继续编辑，以最新工作区作为 local 重算，避免丢失后续改动
+    const liveLocal = persistableSnapshot.value;
+    const localForMerge = deepEqual(liveLocal, pending.local) ? pending.local : clone(liveLocal);
+
+    const result = threeWayMerge({
+      local: localForMerge, remote, base: pending.base,
+      resolutions: pending.resolutions,
+      revision: Math.max(liveLocal.revision, remote.revision) + 1,
+      now: now(), actor: actor.value
+    });
+
+    if (!result.ok || !result.merged) {
+      // 对端又有新改动（或挂起期间的编辑引入新冲突）：重列冲突，保留仍匹配的选择
+      pendingMerge.value = { ...pending, local: localForMerge, remote: clone(remote), resolutions: clone(pending.resolutions) };
+      try { persistSidecar(pendingMerge.value); } catch { /* 忽略，内存仍在 */ }
+      flashNotice('合流前又检测到新的差异，已重新并排列出需要确认的字段，此前可用的选择仍然保留。');
+      return;
+    }
+
+    // 先序列化再写，失败时工作区与挂起包都原样保留，不会退回先保存者的内容
+    try {
+      writeSnapshot(result.merged);
+    } catch (error) {
+      syncError.value = `合流结果写入失败（${(error as Error).message || '存储不可用'}）。词条、版本记录、审校意见和合流选择都已保留，请重试。`;
+      return;
+    }
+    landRevision(result.merged, '词条修订已合流保存：非冲突改动自动并入，冲突字段按你的选择写入。');
+    pendingMerge.value = null;
+    try { persistSidecar(null); } catch { /* 忽略 */ }
   }
 
   function createEntry() {
     const entry: DictionaryEntry = {
-      id: uid('entry'), headword: '新词条', pronunciation: '', partOfSpeech: '', definition: '', dialectVariants: [], examples: [], sources: [], synonyms: [], status: 'draft', notes: '', createdAt: now(), updatedAt: now(), reviewerComments: []
+      id: localUid('entry'), headword: '新词条', pronunciation: '', partOfSpeech: '', definition: '', dialectVariants: [], examples: [], sources: [], synonyms: [], status: 'draft', notes: '', createdAt: now(), updatedAt: now(), reviewerComments: []
     };
     commit('新建词条', '创建草稿词条', [entry.id], () => entries.unshift(entry));
     selectedId.value = entry.id;
@@ -142,7 +419,7 @@ export const useDictionaryStore = defineStore('dictionary', () => {
   function addVariant(entryId: string) {
     const entry = entries.find((item) => item.id === entryId);
     if (!entry) return;
-    const variant = { id: uid('variant'), dialect: '', form: '', pronunciation: '', note: '' };
+    const variant = { id: localUid('variant'), dialect: '', form: '', pronunciation: '', note: '' };
     commit('新增方言变体', '添加一条方言变体', [entryId], () => entry.dialectVariants.push(variant));
   }
 
@@ -165,7 +442,7 @@ export const useDictionaryStore = defineStore('dictionary', () => {
   function addExample(entryId: string) {
     const entry = entries.find((item) => item.id === entryId);
     if (!entry) return;
-    commit('新增例句', '添加一条例句', [entryId], () => entry.examples.push({ id: uid('example'), text: '', translation: '', source: '' }));
+    commit('新增例句', '添加一条例句', [entryId], () => entry.examples.push({ id: localUid('example'), text: '', translation: '', source: '' }));
   }
 
   function updateExample(entryId: string, exampleId: string, field: 'text' | 'translation' | 'source', value: string) {
@@ -187,7 +464,7 @@ export const useDictionaryStore = defineStore('dictionary', () => {
   function addSource(entryId: string) {
     const entry = entries.find((item) => item.id === entryId);
     if (!entry) return;
-    commit('新增来源', '添加一条文献或录音来源', [entryId], () => entry.sources.push({ id: uid('source'), title: '', citation: '', url: '' }));
+    commit('新增来源', '添加一条文献或录音来源', [entryId], () => entry.sources.push({ id: localUid('source'), title: '', citation: '', url: '' }));
   }
 
   function updateSource(entryId: string, sourceId: string, field: 'title' | 'citation' | 'url', value: string) {
@@ -215,7 +492,7 @@ export const useDictionaryStore = defineStore('dictionary', () => {
   function addComment(entryId: string, field: string, message: string, author = '主审·和老师') {
     const entry = entries.find((item) => item.id === entryId);
     if (!entry || !message.trim()) return;
-    const comment: ReviewComment = { id: uid('comment'), field, author, message: message.trim(), status: 'open', createdAt: now(), replies: [] };
+    const comment: ReviewComment = { id: localUid('comment'), field, author, message: message.trim(), status: 'open', createdAt: now(), replies: [] };
     commit('新增审校意见', `对“${field}”添加审校意见`, [entryId], () => entry.reviewerComments.unshift(comment));
   }
 
@@ -223,7 +500,7 @@ export const useDictionaryStore = defineStore('dictionary', () => {
     const entry = entries.find((item) => item.id === entryId);
     const comment = entry?.reviewerComments.find((item) => item.id === commentId);
     if (!entry || !comment || !message.trim()) return;
-    commit('回复审校意见', `回复“${comment.field}”字段意见`, [entryId], () => comment.replies.push({ id: uid('reply'), author, message: message.trim(), createdAt: now() }));
+    commit('回复审校意见', `回复“${comment.field}”字段意见`, [entryId], () => comment.replies.push({ id: localUid('reply'), author, message: message.trim(), createdAt: now() }));
   }
 
   function toggleComment(entryId: string, commentId: string) {
@@ -297,10 +574,23 @@ export const useDictionaryStore = defineStore('dictionary', () => {
 
   function hydrateFromBrowser() {
     try {
-      const raw = localStorage.getItem('sologsb-1021-dictionary-v1');
-      if (raw) restore(JSON.parse(raw) as DictionarySnapshot);
+      const remote = readRemote();
+      const sidecar = readSidecar();
+      if (sidecar) {
+        // 恢复上次未确认的合流：回到当时的工作区，基快照不变，对话框重新打开
+        adopt(sidecar.local);
+        baseSnapshot.value = clone(sidecar.base);
+        pendingMerge.value = { ...sidecar, remote: remote ? clone(remote) : sidecar.remote };
+      } else if (remote) {
+        adopt(remote);
+        baseSnapshot.value = clone(remote);
+      } else {
+        baseSnapshot.value = snapshot();
+        try { writeSnapshot(baseSnapshot.value); } catch { /* 首次写入失败时由编辑触发重试 */ }
+      }
     } catch {
-      localStorage.removeItem('sologsb-1021-dictionary-v1');
+      baseSnapshot.value = snapshot();
+      syncError.value = '浏览器中的词库数据无法解析，已载入内置示例且不会覆盖你的存储；请导出可用备份后再处理。';
     } finally {
       hydrated.value = true;
     }
@@ -312,10 +602,13 @@ export const useDictionaryStore = defineStore('dictionary', () => {
 
   return {
     revision, entries, versions, audit, selectedId, hydrated, query, statusFilter, dialectFilter, fieldReplyDrafts,
+    actor, pendingMerge, pendingConflicts, pendingResolvedCount, syncError, syncNotice,
     selectedEntry, filteredEntries, dialects, duplicates, openComments, persistableSnapshot,
     canUndo: computed(() => undoStack.value.length > 0), canRedo: computed(() => redoStack.value.length > 0),
     createEntry, updateField, setStatus, addVariant, updateVariant, removeVariant, addExample, updateExample, removeExample,
     addSource, updateSource, removeSource, setSynonyms, addComment, replyComment, toggleComment, deleteEntry, mergeEntries,
-    undo, redo, restoreVersion, hydrateFromBrowser, exportPackage
+    undo, redo, restoreVersion, hydrateFromBrowser, exportPackage,
+    syncToBrowser, retrySync, handleExternalStorage, chooseResolution, resolvePendingMerge, flashNotice,
+    dismissSyncError: () => { syncError.value = ''; }
   };
 });

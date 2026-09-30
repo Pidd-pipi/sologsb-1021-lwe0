@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import EntrySidebar from '~/components/EntrySidebar.vue';
 import EntryEditor from '~/components/EntryEditor.vue';
 import ReviewPanel from '~/components/ReviewPanel.vue';
 import DuplicateMergeDialog from '~/components/DuplicateMergeDialog.vue';
 import DeleteImpactDialog from '~/components/DeleteImpactDialog.vue';
 import VersionDrawer from '~/components/VersionDrawer.vue';
+import RevisionMergeDialog from '~/components/RevisionMergeDialog.vue';
 import { useDictionaryStore } from '~/store/dictionary';
 import { referencesToEntry } from '~/utils/dictionary';
 import type { DictionaryEntry } from '~/types/dictionary';
@@ -14,8 +15,11 @@ const store = useDictionaryStore();
 const duplicateOpen = ref(false);
 const versionsOpen = ref(false);
 const deleteOpen = ref(false);
+const reviseOpen = ref(false);
 const deleteTarget = ref<DictionaryEntry | null>(null);
-const statusText = ref('本地数据已同步');
+const statusText = computed(() => store.syncNotice || (store.pendingMerge ? '存在待确认的多人修订合流' : '本地数据已同步'));
+
+watch(() => store.pendingMerge, (pending) => { if (pending) reviseOpen.value = true; });
 
 const impacts = computed(() => deleteTarget.value ? referencesToEntry(store.entries, deleteTarget.value) : []);
 
@@ -29,14 +33,12 @@ const confirmDelete = () => {
   const name = deleteTarget.value.headword;
   store.deleteEntry(deleteTarget.value.id);
   deleteOpen.value = false;
-  statusText.value = `已删除“${name}”，可在版本记录中恢复`;
-  window.setTimeout(() => { statusText.value = '本地数据已同步'; }, 3200);
+  store.flashNotice(`已删除“${name}”，可在版本记录中恢复`);
 };
 
 const openDuplicates = () => {
   if (!store.duplicates.length) {
-    statusText.value = '当前没有检测到高度相似的重复词条';
-    window.setTimeout(() => { statusText.value = '本地数据已同步'; }, 2600);
+    store.flashNotice('当前没有检测到高度相似的重复词条');
     return;
   }
   duplicateOpen.value = true;
@@ -86,7 +88,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', keyboard));
   <div class="app-shell">
     <header class="topbar">
       <div class="brand"><div class="brand-seal">语</div><div><h1>濒危语言词典编辑与审校</h1><p>ENDANGERED LANGUAGE LEXICON WORKBENCH</p></div></div>
-      <div class="offline-status"><span class="online-dot" />{{ statusText }}</div>
+      <div class="offline-status"><span class="online-dot" :class="{ pending: store.pendingMerge, error: store.syncError }" />{{ statusText }}</div>
       <div class="top-actions">
         <t-button variant="text" theme="default" :disabled="!store.canUndo" @click="store.undo">撤销</t-button>
         <t-button variant="text" theme="default" :disabled="!store.canRedo" @click="store.redo">重做</t-button>
@@ -104,6 +106,17 @@ onBeforeUnmount(() => window.removeEventListener('keydown', keyboard));
         <div><strong>{{ store.openComments }}</strong><span>待回复意见</span></div>
         <div><strong>{{ store.duplicates.length }}</strong><span>疑似重复</span></div>
       </div>
+    </section>
+
+    <section v-if="store.pendingMerge || store.syncError" class="merge-banner" :class="{ error: store.syncError }">
+      <template v-if="store.syncError">
+        <span>⚠ {{ store.syncError }}</span>
+        <t-button size="small" theme="danger" variant="outline" @click="store.retrySync">保留当前状态并重试</t-button>
+      </template>
+      <template v-else>
+        <span>另一编校页面的修订与本页存在 {{ store.pendingConflicts.length }} 处待确认冲突；非冲突改动已可自动并入，确认前不会写回。</span>
+        <t-button size="small" theme="warning" variant="outline" @click="reviseOpen = true">并排确认合流（{{ store.pendingResolvedCount }}/{{ store.pendingConflicts.length }} 已选）</t-button>
+      </template>
     </section>
 
     <main class="workspace">
@@ -128,6 +141,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', keyboard));
       <DuplicateMergeDialog v-model="duplicateOpen" :pairs="store.duplicates" />
       <DeleteImpactDialog v-model="deleteOpen" :entry="deleteTarget" :impacts="impacts" @confirm="confirmDelete" />
       <VersionDrawer v-model="versionsOpen" />
+      <RevisionMergeDialog v-model="reviseOpen" />
     </ClientOnly>
   </div>
 </template>

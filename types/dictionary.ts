@@ -71,6 +71,8 @@ export interface DictionarySnapshot {
   entries: DictionaryEntry[];
   versions: VersionRecord[];
   audit: AuditRecord[];
+  /** 最近选中的词条，随修订一起保存 */
+  selectedId?: string;
 }
 
 export interface DuplicatePair {
