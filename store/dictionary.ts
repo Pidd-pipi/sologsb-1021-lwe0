@@ -4,6 +4,12 @@ import type {
   AuditRecord, DictionaryEntry, DictionarySnapshot, DuplicatePair, EntryStatus, ReviewComment, VersionRecord
 } from '~/types/dictionary';
 import { findDuplicates } from '~/utils/dictionary';
+import {
+  applyConflictResolutions, buildMergeAudit, mergeSnapshots
+} from '~/utils/merge';
+import type { ConflictResolution, MergeConflict } from '~/utils/merge';
+
+const STORAGE_KEY = 'sologsb-1021-dictionary-v1';
 
 const now = () => new Date().toISOString();
 const uid = (prefix: string) => `${prefix}-${Math.random().toString(36).slice(2, 9)}-${Date.now().toString(36)}`;
@@ -67,6 +73,13 @@ export const useDictionaryStore = defineStore('dictionary', () => {
   const dialectFilter = ref('all');
   const fieldReplyDrafts = reactive<Record<string, string>>({});
 
+  // 多端合流：baseSnapshot 是本端最近一次同步时的共同基线；
+  // 远端修订号大于基线时走三路合并，冲突未确认前不写回。
+  const baseSnapshot = ref<DictionarySnapshot | null>(null);
+  const pendingConflicts = ref<MergeConflict[]>([]);
+  const syncState = ref<'idle' | 'saving' | 'conflict' | 'retrying'>('idle');
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
   const selectedEntry = computed(() => entries.find((entry) => entry.id === selectedId.value) ?? entries[0]);
   const persistableSnapshot = computed<DictionarySnapshot>(() => ({
     revision: revision.value,
@@ -103,6 +116,148 @@ export const useDictionaryStore = defineStore('dictionary', () => {
     versions.splice(0, versions.length, ...(clone(value.versions ?? [])));
     audit.splice(0, audit.length, ...(clone(value.audit ?? [])));
     if (!entries.some((entry) => entry.id === selectedId.value)) selectedId.value = entries[0]?.id ?? '';
+  }
+
+  /** 把合流后的快照反映到界面（仅当与当前状态不同），并修正选中词条 */
+  function adoptSnapshot(value: DictionarySnapshot) {
+    revision.value = value.revision ?? 1;
+    entries.splice(0, entries.length, ...(clone(value.entries ?? [])));
+    versions.splice(0, versions.length, ...(clone(value.versions ?? [])));
+    audit.splice(0, audit.length, ...(clone(value.audit ?? [])));
+    if (!entries.some((entry) => entry.id === selectedId.value)) selectedId.value = entries[0]?.id ?? '';
+  }
+
+  function readRemoteSnapshot(): DictionarySnapshot | null {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as DictionarySnapshot;
+      if (!parsed || !Array.isArray(parsed.entries)) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 比较并交换（CAS）写回：只有远端修订号与读取时一致才写入，
+   * 避免把其他端刚保存的内容覆盖掉。返回 false 时调用方重新读取合流。
+   */
+  function writeRemoteSnapshot(value: DictionarySnapshot, expectedRevision: number | null): boolean {
+    try {
+      const current = readRemoteSnapshot();
+      if (expectedRevision === null) {
+        if (current !== null) return false;
+      } else if (current && current.revision !== expectedRevision) {
+        return false;
+      }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const withMergeAudit = (merged: ReturnType<typeof mergeSnapshots>, choices: Record<string, ConflictResolution>): DictionarySnapshot => {
+    const out = clone(merged.snapshot);
+    const auditRecord = buildMergeAudit(merged.conflicts, choices, merged.autoCount, merged.changedEntryIds);
+    out.audit = [auditRecord, ...out.audit].slice(0, 300);
+    return out;
+  };
+
+  /**
+   * 保存工作副本：读取远端最新快照，按基线做三路合流后整体写回。
+   * - 无冲突：CAS 写入，版本记录、审校意见与合流结果保存在同一份快照里；
+   * - 有冲突：不写回，pendingConflicts 并排列出，等待逐处确认；
+   * - 写入失败：保留当前状态，稍后重试；重试重新读取远端并重新合流，
+   *   已保存的内容不会被回退。
+   */
+  async function persist() {
+    if (!hydrated.value) return;
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = undefined;
+    }
+    const local = snapshot();
+    let remote = readRemoteSnapshot();
+    if (!baseSnapshot.value) baseSnapshot.value = remote ? clone(remote) : clone(local);
+    const base = baseSnapshot.value;
+
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      if (!remote || remote.revision <= base.revision) {
+        const expected = remote ? remote.revision : null;
+        if (writeRemoteSnapshot(local, expected)) {
+          baseSnapshot.value = clone(local);
+          pendingConflicts.value = [];
+          syncState.value = 'idle';
+          return;
+        }
+        remote = readRemoteSnapshot();
+        continue;
+      }
+
+      const merged = mergeSnapshots(base, local, remote);
+      if (merged.conflicts.length) {
+        pendingConflicts.value = merged.conflicts;
+        syncState.value = 'conflict';
+        return;
+      }
+      const out = withMergeAudit(merged, {});
+      if (writeRemoteSnapshot(out, remote.revision)) {
+        baseSnapshot.value = clone(out);
+        if (JSON.stringify(snapshot()) !== JSON.stringify(out)) adoptSnapshot(out);
+        pendingConflicts.value = [];
+        syncState.value = 'idle';
+        return;
+      }
+      remote = readRemoteSnapshot();
+    }
+
+    syncState.value = 'retrying';
+    retryTimer = setTimeout(() => { void persist(); }, 1500);
+  }
+
+  /** 用户逐处确认冲突后，应用选择并写回；处理期间远端又变化则重新合流 */
+  async function resolveConflicts(choices: Record<string, ConflictResolution>) {
+    if (!hydrated.value) return;
+    const local = snapshot();
+    let remote = readRemoteSnapshot();
+    if (!baseSnapshot.value) baseSnapshot.value = remote ? clone(remote) : clone(local);
+    const base = baseSnapshot.value;
+
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      if (!remote || remote.revision <= base.revision) {
+        pendingConflicts.value = [];
+        syncState.value = 'idle';
+        void persist();
+        return;
+      }
+      const merged = mergeSnapshots(base, local, remote);
+      const resolvedChoices: Record<string, ConflictResolution> = {};
+      merged.conflicts.forEach((conflict) => {
+        resolvedChoices[conflict.id] = choices[conflict.id] ?? 'ours';
+      });
+      const unanswered = merged.conflicts.filter((conflict) => !(conflict.id in choices));
+      if (unanswered.length) {
+        // 确认期间远端又带来新冲突：更新并排列表，已作答的选择按冲突标识保留
+        pendingConflicts.value = merged.conflicts;
+        syncState.value = 'conflict';
+        return;
+      }
+      const applied = applyConflictResolutions(merged.snapshot, merged.conflicts, resolvedChoices);
+      const out = withMergeAudit({ ...merged, snapshot: applied }, resolvedChoices);
+      if (writeRemoteSnapshot(out, remote.revision)) {
+        baseSnapshot.value = clone(out);
+        if (JSON.stringify(snapshot()) !== JSON.stringify(out)) adoptSnapshot(out);
+        pendingConflicts.value = [];
+        syncState.value = 'idle';
+        return;
+      }
+      remote = readRemoteSnapshot();
+    }
+
+    syncState.value = 'retrying';
+    retryTimer = setTimeout(() => { void resolveConflicts(choices); }, 1500);
   }
 
   function commit(action: string, detail: string, entryIds: string[], mutation: () => void) {
@@ -297,10 +452,17 @@ export const useDictionaryStore = defineStore('dictionary', () => {
 
   function hydrateFromBrowser() {
     try {
-      const raw = localStorage.getItem('sologsb-1021-dictionary-v1');
-      if (raw) restore(JSON.parse(raw) as DictionarySnapshot);
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as DictionarySnapshot;
+        adoptSnapshot(parsed);
+        baseSnapshot.value = clone(parsed);
+      } else {
+        baseSnapshot.value = clone(snapshot());
+      }
     } catch {
-      localStorage.removeItem('sologsb-1021-dictionary-v1');
+      localStorage.removeItem(STORAGE_KEY);
+      baseSnapshot.value = clone(snapshot());
     } finally {
       hydrated.value = true;
     }
@@ -312,10 +474,11 @@ export const useDictionaryStore = defineStore('dictionary', () => {
 
   return {
     revision, entries, versions, audit, selectedId, hydrated, query, statusFilter, dialectFilter, fieldReplyDrafts,
+    baseSnapshot, pendingConflicts, syncState,
     selectedEntry, filteredEntries, dialects, duplicates, openComments, persistableSnapshot,
     canUndo: computed(() => undoStack.value.length > 0), canRedo: computed(() => redoStack.value.length > 0),
     createEntry, updateField, setStatus, addVariant, updateVariant, removeVariant, addExample, updateExample, removeExample,
     addSource, updateSource, removeSource, setSynonyms, addComment, replyComment, toggleComment, deleteEntry, mergeEntries,
-    undo, redo, restoreVersion, hydrateFromBrowser, exportPackage
+    undo, redo, restoreVersion, hydrateFromBrowser, persist, resolveConflicts, exportPackage
   };
 });

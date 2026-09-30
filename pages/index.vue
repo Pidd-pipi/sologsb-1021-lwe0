@@ -6,14 +6,17 @@ import ReviewPanel from '~/components/ReviewPanel.vue';
 import DuplicateMergeDialog from '~/components/DuplicateMergeDialog.vue';
 import DeleteImpactDialog from '~/components/DeleteImpactDialog.vue';
 import VersionDrawer from '~/components/VersionDrawer.vue';
+import RevisionConflictDialog from '~/components/RevisionConflictDialog.vue';
 import { useDictionaryStore } from '~/store/dictionary';
 import { referencesToEntry } from '~/utils/dictionary';
+import type { ConflictResolution } from '~/utils/merge';
 import type { DictionaryEntry } from '~/types/dictionary';
 
 const store = useDictionaryStore();
 const duplicateOpen = ref(false);
 const versionsOpen = ref(false);
 const deleteOpen = ref(false);
+const conflictOpen = ref(false);
 const deleteTarget = ref<DictionaryEntry | null>(null);
 const statusText = ref('本地数据已同步');
 
@@ -40,6 +43,11 @@ const openDuplicates = () => {
     return;
   }
   duplicateOpen.value = true;
+};
+
+const confirmConflicts = async (choices: Record<string, ConflictResolution>) => {
+  await store.resolveConflicts(choices);
+  if (store.syncState !== 'conflict') conflictOpen.value = false;
 };
 
 const exportData = () => {
@@ -106,6 +114,23 @@ onBeforeUnmount(() => window.removeEventListener('keydown', keyboard));
       </div>
     </section>
 
+    <section
+      v-if="store.syncState === 'conflict'"
+      class="sync-banner conflict"
+    >
+      <strong>检测到 {{ store.pendingConflicts.length }} 处多端修订冲突</strong>
+      <span>两个页面都基于旧快照编辑了同一份词库：未碰同一字段的改动已自动并入，以下冲突需逐处确认，确认前不会写回。</span>
+      <t-button size="small" theme="primary" @click="conflictOpen = true">逐处确认并合流</t-button>
+    </section>
+    <section
+      v-else-if="store.syncState === 'retrying'"
+      class="sync-banner retrying"
+    >
+      <strong>写入失败，正在重试…</strong>
+      <span>当前编辑状态已保留；重试会重新读取最新快照再合流，已保存的内容不会回退。</span>
+      <t-button size="small" variant="outline" @click="store.persist()">立即重试</t-button>
+    </section>
+
     <main class="workspace">
       <EntrySidebar @create="store.createEntry" @duplicates="openDuplicates" @versions="versionsOpen = true" />
       <EntryEditor />
@@ -128,6 +153,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', keyboard));
       <DuplicateMergeDialog v-model="duplicateOpen" :pairs="store.duplicates" />
       <DeleteImpactDialog v-model="deleteOpen" :entry="deleteTarget" :impacts="impacts" @confirm="confirmDelete" />
       <VersionDrawer v-model="versionsOpen" />
+      <RevisionConflictDialog v-model="conflictOpen" :conflicts="store.pendingConflicts" @confirm="confirmConflicts" />
     </ClientOnly>
   </div>
 </template>
